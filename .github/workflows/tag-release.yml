@@ -50,21 +50,11 @@ jobs:
         run: |
           cat otel-collector/envs >> "$GITHUB_OUTPUT"
 
-      - name: determine tag
-        id: determine-tag
-        run: |
-          # Set TARGET_TAG based on the trigger type
-          if [[ "${{ inputs.milestone }}" ]]; then
-            echo "TARGET_TAG=${{ inputs.milestone }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "TARGET_TAG=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: create tags
         id: create-tags
         run: |
           # Get the target tag from the previous step
-          TARGET_TAG="${{ steps.determine-tag.outputs.TARGET_TAG }}"
+          TARGET_TAG= "${{ inputs.milestone  || github.ref_name }}"
           
           # Set the current tag and tags output
           echo "CURRENT_TAG=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
