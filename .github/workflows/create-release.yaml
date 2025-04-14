@@ -63,6 +63,9 @@ jobs:
     needs:
       - validate-release
     uses: ./.github/workflows/tag-release.yml
+    with:
+      milestone: ${{ inputs.release_version }}
+
     permissions:
       id-token: write
       contents: write

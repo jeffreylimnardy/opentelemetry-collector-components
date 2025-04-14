@@ -6,6 +6,11 @@ on:
       - "[0-9]+.[0-9]+.[0-9]+"
       - "[0-9]+.[0-9]+.[0-9]+-*"
   workflow_call:
+    inputs:
+      milestone:
+        description: 'Milestone to be released'
+        required: true
+        type: string
 
 permissions:
   id-token: write # This is required for requesting the JWT token
@@ -45,20 +50,33 @@ jobs:
         run: |
           cat otel-collector/envs >> "$GITHUB_OUTPUT"
 
+      - name: determine tag
+        id: determine-tag
+        run: |
+          # Set TARGET_TAG based on the trigger type
+          if [[ "${{ inputs.milestone }}" ]]; then
+            echo "TARGET_TAG=${{ inputs.milestone }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "TARGET_TAG=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: create tags
         id: create-tags
         run: |
-          # the tag will look similar to: 0.102.1-0.1.0
-          echo 'TAGS=${{ steps.load-envs.outputs.OTEL_VERSION }}-${{ github.ref_name }}' >> "$GITHUB_OUTPUT"
-          echo 'CURRENT_TAG=${{ github.ref_name }}' >> "$GITHUB_OUTPUT"
-
+          # Get the target tag from the previous step
+          TARGET_TAG="${{ steps.determine-tag.outputs.TARGET_TAG }}"
+          
+          # Set the current tag and tags output
+          echo "CURRENT_TAG=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
+          echo "TAGS=${{ steps.load-envs.outputs.OTEL_VERSION }}-${TARGET_TAG}" >> "$GITHUB_OUTPUT"
+          
           # join all tags with the new tag in one list. Inject our new version in the list. Sort the list and get the line prior to the new tag
           previous_version=$(git for-each-ref --sort=creatordate --format '%(refname)' refs/tags \
           | grep -E "^refs/tags/[0-9]+\.[0-9]+\.[0-9]+$" \
           | grep -E "[0-9]+\.[0-9]+\.[0-9]+" -o \
           | sort -t "." -k1,1n -k2,2n -k3,3n \
-          | grep -B 1 ${{ github.ref_name }} | head -1)
-
+          | grep -B 1 ${TARGET_TAG} | head -1)
+          
           echo "PREVIOUS_TAG=${previous_version}" >> "$GITHUB_OUTPUT"
 
   build-image:
