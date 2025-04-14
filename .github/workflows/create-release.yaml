@@ -1,5 +1,5 @@
 name: "Create release"
-run-name: "Create release ${{ inputs.release_version }}"
+run-name: "Create release ${{ inputs.release_version }} with dry-run: ${{inputs.dry-run}}"
 
 permissions:
   contents: write
@@ -20,6 +20,8 @@ jobs:
   # check if tag is a valid semantic version
   # check that no release already exists with that name
   validate-release:
+    env:
+      GH_TOKEN: ${{ github.token }}
     name: Validate release
     runs-on: ubuntu-latest
     steps:
@@ -43,11 +45,25 @@ jobs:
       - name: Check for existing artifacts from previous release runs
         run: "./hack/scripts/check_artifacts_existence.sh ${{ inputs.release_version }}"
 
+      - name: Check if milestone exists and is closed
+        run: "./hack/scripts/check_milestone.sh ${{ github.repository }} ${{ inputs.release_version }}"
+
       # create a branch for the release and push it to the repository
       - name: Create release branch (dry-run)
-        if: ${{ inputs.dry_run == true }}
+        if: ${{ inputs.dry-run == true }}
         run: "./hack/scripts/create_branch_and_tag.sh -v ${{ inputs.release_version }} -r origin -d"
 
       - name: Create release branch
-        if: ${{ inputs.dry_run == false }}
+        if: ${{ inputs.dry-run == false }}
         run: "./hack/scripts/create_branch_and_tag.sh -v ${{ inputs.release_version }} -r origin"
+
+      # run tag-release workflow
+
+  publish-release:
+    needs:
+      - validate-release
+    uses: ./.github/workflows/tag-release.yml
+    permissions:
+      id-token: write
+      contents: write
+    if: inputs.dry-run == false

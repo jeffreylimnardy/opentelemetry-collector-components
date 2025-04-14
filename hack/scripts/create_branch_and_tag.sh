@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 set -e
 set -o pipefail
@@ -30,7 +30,6 @@ regex="^[0-9]+\.[0-9]+\.[0-9]+$"
 
 if [[ $VERSION =~ $regex ]]; then
     echo "Valid release version: $VERSION"
-    exit 0
 else
     echo "Invalid release version: $version. Correct format: <major>.<minor>.<patch>"
     exit 1
