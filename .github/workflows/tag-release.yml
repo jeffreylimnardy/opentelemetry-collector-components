@@ -54,8 +54,8 @@ jobs:
         id: create-tags
         run: |
           # Get the target tag from the previous step
-          TARGET_TAG= "${{ inputs.milestone  || github.ref_name }}"
-          
+          TARGET_TAG="${{ inputs.milestone  || github.ref_name }}"
+
           # Set the current tag and tags output
           echo "CURRENT_TAG=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
           echo "TAGS=${{ steps.load-envs.outputs.OTEL_VERSION }}-${TARGET_TAG}" >> "$GITHUB_OUTPUT"
