@@ -1,12 +1,12 @@
 # Profiling gRPC Memory Retention in the OTel Collector
 
-This guide documents how to reproduce and analyze the `bufio.NewReaderSize` memory retention pattern in the OTel Collector's OTLP gRPC receiver, and explains why this pattern behaves differently inside an Istio service mesh.
+This guide documents how to reproduce and analyze the `bufio.NewReaderSize` memory retention pattern in the OTel Collector's OTLP gRPC receiver and explains when Istio sidecar injection suppresses or permits the pattern.
 
 ## Background
 
-[OTel Collector issue #15086](https://github.com/open-telemetry/opentelemetry-collector/issues/15086) describes a scenario where the collector's heap grows during high gRPC connection churn and only partially releases across multiple GC cycles. The root cause is Go's `sync.Pool`: each incoming TCP connection to the gRPC server creates a `bufio.Reader` (via `newFramer` → `bufio.NewReaderSize`), and when the connection closes, that reader is placed into `sync.Pool`. Pool objects survive one GC cycle before eviction, so under sustained churn, memory accumulates.
+[OTel Collector issue #15086](https://github.com/open-telemetry/opentelemetry-collector/issues/15086) describes a scenario where the collector's heap grows during high gRPC connection churn and only partially releases across multiple GC cycles. The root cause is Go's `sync.Pool`: each incoming TCP connection to the gRPC server creates a `bufio.Reader` (via `newFramer` → `bufio.NewReaderSize`), and when the connection closes, that reader is placed into `sync.Pool`. Pool objects survive one GC cycle before eviction, so under sustained churn, memory accumulates proportionally to the connection rate.
 
-In Kyma's production setup the collector runs inside an Istio service mesh. Envoy sidecars mediate all pod-to-pod traffic, and the pattern behaves very differently there. This guide documents both scenarios.
+In Kyma's production setup the collector runs inside an Istio service mesh. Whether the pattern manifests depends entirely on **whether the collector container itself sees individual TCP connections or just a small pooled set from its local Envoy sidecar**. This guide documents all three relevant scenarios.
 
 ## Tools
 
@@ -14,7 +14,8 @@ In Kyma's production setup the collector runs inside an Istio service mesh. Envo
 - `curl` with `?gc=1` on the pprof endpoint — triggers a GC before capturing the heap snapshot
 - The [churn load generator](#churn-load-generator) — a small Go program that repeatedly dials gRPC, sends spans, and closes the connection
 - `kubectl port-forward` — access the collector's pprof endpoint from outside the cluster
-- Envoy admin API (`http://127.0.0.1:15000/clusters`) — inspect actual TCP connection counts from Istio sidecars
+- Envoy admin API (`http://127.0.0.1:15000/clusters`) — inspect actual TCP connection counts
+- `nsenter -n -t <pid> -- ss -tn` — inspect TCP connections inside a container's network namespace
 
 ## Churn Load Generator
 
@@ -40,11 +41,11 @@ import (
 )
 
 func main() {
-    endpoint    := flag.String("endpoint", "127.0.0.1:4317", "collector endpoint")
-    workers     := flag.Int("workers", 32, "concurrent workers")
-    duration    := flag.Duration("duration", 5*time.Minute, "test duration")
+    endpoint     := flag.String("endpoint", "127.0.0.1:4317", "collector endpoint")
+    workers      := flag.Int("workers", 32, "concurrent workers")
+    duration     := flag.Duration("duration", 5*time.Minute, "test duration")
     spansPerConn := flag.Int("spans", 10, "spans per connection before close")
-    pause       := flag.Duration("pause", 200*time.Millisecond, "pause between connections per worker")
+    pause        := flag.Duration("pause", 200*time.Millisecond, "pause between connections per worker")
     flag.Parse()
 
     deadline := time.Now().Add(*duration)
@@ -148,7 +149,7 @@ service:
 
 ## Profiling Workflow
 
-The double-GC technique is critical: calling `?gc=1` triggers one GC before the snapshot. To see what survives two GC cycles, capture three sequential profiles with `?gc=1` each.
+The double-GC technique is critical: calling `?gc=1` triggers one GC before the snapshot. Capturing three sequential profiles reveals what survives across multiple GC cycles.
 
 ```bash
 COLLECTOR=127.0.0.1:1777
@@ -171,11 +172,18 @@ Analyze with:
 # Show top allocations
 go tool pprof -inuse_space -top heap-load.pb.gz
 
-# Diff: what changed between load and baseline
+# Diff: what changed between baseline and load
 go tool pprof -inuse_space -base heap-baseline.pb.gz -top heap-load.pb.gz
 
 # Diff: what survives 3 GC cycles after load ends
 go tool pprof -inuse_space -base heap-load.pb.gz -top heap-after-3.pb.gz
+```
+
+In a Kubernetes environment, port-forward to the pprof endpoint before capturing:
+
+```bash
+kubectl port-forward -n <namespace> <pod> 1778:1777 &
+curl -s "http://127.0.0.1:1778/debug/pprof/heap?gc=1" -o heap-load.pb.gz
 ```
 
 ## Results: Bare-Metal (Direct gRPC)
@@ -185,7 +193,7 @@ Test parameters: 32 workers, 200 ms pause, 10 spans/connection, 5 minutes, ~35 0
 | Profile | Total heap | `bufio.NewReaderSize` |
 |---|---|---|
 | baseline | 21.8 MB | 0 |
-| load (mid-run) | 27.2 MB | **6.5 MB** (23.8 % of heap) |
+| load (mid-run) | 27.2 MB | **6.5 MB** (23.8% of heap) |
 | after-1 GC | 27.8 MB | 6.5 MB |
 | after-2 GC | 26.1 MB | 4.9 MB |
 | after-3 GC | 21.6 MB | **0.81 MB** |
@@ -194,63 +202,123 @@ The `load - baseline` diff isolates the cause:
 
 ```
 flat   flat%   cum
-6479 kB  86 %   bufio.NewReaderSize (inline)
-              google.golang.org/grpc.(*Server).Serve.func3
-              google.golang.org/grpc.(*Server).handleRawConn
-              google.golang.org/grpc.(*Server).newHTTP2Transport
-              google.golang.org/grpc/internal/transport.NewServerTransport
-              google.golang.org/grpc/internal/transport.newFramer
+6479 kB  86%    bufio.NewReaderSize (inline)
+                google.golang.org/grpc.(*Server).Serve.func3
+                google.golang.org/grpc.(*Server).handleRawConn
+                google.golang.org/grpc.(*Server).newHTTP2Transport
+                google.golang.org/grpc/internal/transport.NewServerTransport
+                google.golang.org/grpc/internal/transport.newFramer
 ```
 
-Every new TCP connection triggers this call chain once. The resulting `bufio.Reader` (32 KB default) is placed into `sync.Pool` on connection close. Pool objects survive one GC cycle, so at 35 000 connections the pool accumulates ~6.5 MB that only fully releases after the third post-load GC.
+Every new TCP connection triggers this call chain once. The resulting `bufio.Reader` (32 KB default) is placed into `sync.Pool` on connection close. Under sustained churn, the pool accumulates ~6.5 MB that clears in 3 GC cycles after load stops.
 
-This matches the bounded pattern described in issue #15086: the retention is proportional to the churn rate, not unbounded, and clears completely within 3 GC cycles. It is not a memory leak.
+This is a bounded pattern (proportional to churn rate, not unbounded) but it causes persistent elevated heap usage under ongoing pod-level connection churn in production.
 
-## Results: Istio Service Mesh
+## Istio Mesh — Three Scenarios
 
-When the collector and its clients both run in pods with Istio sidecars injected, the Envoy proxies intercept all traffic and establish mTLS connections between themselves. From the collector's gRPC server, this means all client streams arrive over a small, persistent pool of Envoy-to-Envoy HTTP/2 TCP connections rather than individual short-lived ones.
+The pattern's behavior in an Istio mesh depends on a single property: **how many TCP connections the collector container itself accepts**. This is determined by whether the collector's Envoy sidecar intercepts port 4317 inbound traffic and pools it, or whether connections arrive at the container directly.
 
-Test parameters: identical to bare-metal. Two runs, ~45 000 and ~45 000 logical gRPC client dials.
+### Scenario 1: Full Mesh — Sidecar with Port 4317 Intercepted (Pattern Suppressed)
 
-### Envoy Connection Pool — The Key Measurement
+This is the configuration when the collector has Istio injection enabled and no inbound port exclusions.
 
-Query the inbound cluster stats on the collector's Envoy sidecar while the load generator is running:
+The collector's Envoy sidecar intercepts all traffic on port 4317 via iptables (`ISTIO_INBOUND` chain redirects to the virtualInbound listener). It then proxies to the collector container using its own local connection pool.
+
+**Observation (45 000 logical gRPC dials from 1 source pod → 10 separate pods):**
 
 ```bash
-kubectl exec -n otel-test <otel-collector-pod> -c istio-proxy -- \
+# Envoy sidecar on collector pod
+kubectl exec <otel-collector-pod> -c istio-proxy -- \
   sh -c 'curl -s http://127.0.0.1:15000/clusters' | grep "inbound|4317" | grep -E "(cx_|rq_)"
+
+inbound|4317||::cx_active: 2
+inbound|4317||::cx_total:  2      ← fixed at 2 regardless of source pod count
+inbound|4317||::rq_total:  90414  ← 90k RPCs over those 2 connections
 ```
 
-Observed at ~20 000 logical client connections opened:
+Envoy multiplexes all gRPC streams (from all source pods' Envoys) over 2 persistent HTTP/2 connections to the collector container. The collector container sees only 2 TCP connections regardless of how many pods are connecting or restarting.
 
-```
-inbound|4317||::10.42.0.26:4317::cx_active: 2
-inbound|4317||::10.42.0.26:4317::cx_total:  2      ← only 2 TCP connections ever
-inbound|4317||::10.42.0.26:4317::rq_total:  67048  ← all 67k RPCs over those 2 connections
-```
-
-The `cx_total` counter never advances beyond 2 regardless of how many times the churn client calls `otlptracegrpc.New`. Envoy multiplexes every gRPC stream over the two persistent mTLS HTTP/2 connections it maintains.
-
-### Heap Profiles Under Mesh
+**Heap profiles:**
 
 | Profile | Total heap | `bufio.NewReaderSize` |
 |---|---|---|
-| load (run 1, ~45 k conns) | 18.8 MB | 0 |
-| after-1 GC | 18.8 MB | 0 |
-| after-2 GC | 18.8 MB | 0 |
-| after-3 GC | 18.8 MB | 0 |
-| load (run 2, ~45 k conns) | 19.6 MB | 0.81 MB |
-| after-1/2/3 GC | 19.6 MB | 0.81 MB |
+| load (~45k conns) | 18.8 MB | 0 |
+| after-1/2/3 GC | 18.8 MB | 0 |
 
-The 0.81 MB of `bufio.NewReaderSize` visible in run 2 is the normal steady-state for the 2 permanent connections plus other internal gRPC connections (e.g. internal OTLP pipelines). It is identical to what remains after the 3rd post-load GC in the bare-metal run — the baseline for any running collector. There is no additional accumulation from the churn.
+No `bufio` accumulation. The pattern is fully suppressed.
 
-## Conclusion
+### Scenario 2: Collector Without Sidecar Injection (Pattern Active)
 
-| Scenario | TCP connections seen by collector | `bufio` accumulation during churn |
+When the collector pod has `sidecar.istio.io/inject: "false"` (or is in a namespace without `istio-injection: enabled`), all inbound connections arrive directly at the collector container. Source pods with sidecars still create per-pod Envoy-to-collector TCP connections.
+
+**Observation (15 source pods, each with a sidecar, targeting sidecar-less collector):**
+
+```bash
+# From the node, inspect the collector container's network namespace
+COLLECTOR_PID=$(pgrep otelcol-contrib)
+nsenter -n -t $COLLECTOR_PID -- ss -tn state established | grep ":4317"
+
+# 30 ESTABLISHED connections: each source Envoy maintains 2 HTTP/2 connections
+# to the collector container (15 pods × 2 connections per Envoy = 30 total)
+```
+
+Each source pod's Envoy sidecar creates its own HTTP/2 connection pool (2 connections) directly to the collector container. When pods restart, those connections close and new ones open — each new connection creates a new `bufio.Reader` in the gRPC server.
+
+**Heap profile at 30 active direct connections:**
+
+| Profile | Total heap | `bufio.NewReaderSize` |
 |---|---|---|
-| Bare-metal | one per client dial (~35 k) | +6.5 MB, clears in 3 GC cycles |
-| Istio mesh | 2 (Envoy pools all streams) | none beyond the steady-state 0.81 MB |
+| load (30 direct conns) | 32.5 MB | **16.2 MB** (49.9% of heap) |
 
-The `bufio.NewReaderSize` retention pattern described in OTel issue #15086 is real but bounded: it is proportional to the rate of new TCP connections arriving at the gRPC server. In a Kyma production environment with Istio sidecars, Envoy's connection pooling prevents new TCP connections from being created at the collector for each client dial. The collector sees only the handful of long-lived Envoy-to-Envoy HTTP/2 connections, so the sync.Pool accumulation pattern never manifests.
+The diff:
+```
+flat   flat%   cum
+16199 kB  86%   bufio.NewReaderSize (inline)
+ 1056 kB   6%   google.golang.org/grpc/internal/transport.newBufWriter
+```
 
-If you observe elevated `bufio.NewReaderSize` retention in a Kyma environment, verify that Istio sidecar injection is active on the collector pod (`kubectl get pod <pod> -o jsonpath='{.spec.containers[*].name}'` should include `istio-proxy`) and confirm that `cx_total` on the `inbound|4317` cluster is not growing unexpectedly.
+Same 86% signature as bare-metal. The pattern is fully active, driven by pod-level connection churn.
+
+### Scenario 3: Sidecar Present but Port 4317 Excluded from Interception
+
+Setting the annotation `traffic.sidecar.istio.io/excludeInboundPorts: "4317"` causes the `istio-init` container to add a `RETURN` rule in the `ISTIO_INBOUND` iptables chain specifically for port 4317, before the standard redirect rule:
+
+```
+Chain ISTIO_INBOUND:
+RETURN  tcp dpt:4317   ← traffic on port 4317 skips Envoy redirect
+ISTIO_IN_REDIRECT      ← all other ports redirect to Envoy
+```
+
+In this case the Envoy sidecar is present but does not intercept port 4317 inbound traffic. The net effect is the same as Scenario 2: direct connections arrive at the collector container.
+
+**Important:** clients using mTLS (e.g., other mesh pods with sidecars) will fail to connect because the collector container receives TLS-encrypted data without a TLS listener. This annotation is only meaningful when paired with a `DestinationRule` that sets `trafficPolicy.tls.mode: DISABLE` for the collector's port, or when the traffic source explicitly sends plaintext.
+
+## Connection Count as a Diagnostic
+
+The most direct way to determine which scenario applies is to compare the TCP connection count visible to the collector container against the Envoy cluster stats:
+
+```bash
+# 1. Connections the container actually sees (from host, find the container PID first)
+COLLECTOR_PID=$(pgrep otelcol-contrib)
+nsenter -n -t $COLLECTOR_PID -- ss -tn state established | grep -c ":4317 "
+
+# 2. Connections the local Envoy sidecar proxies to the container
+kubectl exec <pod> -c istio-proxy -- \
+  sh -c 'curl -s http://127.0.0.1:15000/clusters' | grep "inbound|4317" | grep cx_total
+```
+
+| Result | Interpretation |
+|---|---|
+| container sees 2 connections, `cx_total` = 2 | Full mesh protection — Scenario 1 |
+| container sees N connections, no `cx_total` stat | No sidecar injection — Scenario 2 |
+| container sees N connections, `cx_total` absent | Port excluded from sidecar — Scenario 3 |
+
+## Summary
+
+| Deployment | TCP connections to collector container | `bufio` accumulation |
+|---|---|---|
+| No sidecar on collector | One per source Envoy (2 × pod count) | Active — proportional to pod restarts |
+| Sidecar with port 4317 excluded | One per source Envoy (2 × pod count) | Active — same as no-sidecar for plaintext clients |
+| Full sidecar, port 4317 intercepted | 2 (Envoy pools all sources) | Suppressed — only baseline 0.81 MB |
+
+The pattern described in OTel issue #15086 is real but bounded. It manifests in Kyma production whenever the collector receives direct TCP connections — either because the sidecar is absent or port 4317 is excluded from interception. Under those conditions, pod-level restarts and rolling deployments act as the churn source, each pod restart contributing 2 new `bufio.Reader` objects that persist in `sync.Pool` until the next GC cycle.
